@@ -177,20 +177,21 @@ export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
-		// SSE transport is primary as requested
+		// Streamable HTTP transport (MCP 2025-11-25 spec)
+		if (url.pathname.startsWith("/mcp")) {
+			return NciPdcMCP.serve("/mcp").fetch(request, env, ctx);
+		}
+
+		// SSE transport (legacy, kept for backward compatibility)
 		if (url.pathname === "/sse" || url.pathname.startsWith("/sse/")) {
-			// @ts-ignore - This is used in the example, presumably to handle potential slight
-            // mismatches between the generic `fetch` signature expected by some runtimes
-            // and the specific signature of the `fetch` method returned by `serveSSE`.
+			// @ts-ignore
 			return NciPdcMCP.serveSSE("/sse").fetch(request, env, ctx);
 		}
-		
+
 		// Fallback for unhandled paths
-		console.error(`NCI PDC MCP Server. Requested path ${url.pathname} not found. Listening for SSE on /sse.`);
-		
 		return new Response(
-			`NCI PDC MCP Server - Path not found.\nAvailable MCP paths:\n- /sse (for Server-Sent Events transport)`, 
-			{ 
+			`NCI PDC MCP Server - Path not found.\nAvailable MCP paths:\n- /mcp (Streamable HTTP)\n- /sse (Server-Sent Events)`,
+			{
 				status: 404,
 				headers: { "Content-Type": "text/plain" }
 			}
