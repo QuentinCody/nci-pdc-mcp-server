@@ -1,8 +1,13 @@
-import { McpAgent } from "agents/mcp"; // Assuming McpAgent is available via this path as per the example.
-                                        // This might be a project-local base class or an alias to an SDK import
-                                        // that provides the static `serveSSE` method and a base class structure.
+import { McpAgent } from "agents/mcp";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { shouldStage, stageToDoAndRespond } from "@bio-mcp/shared/staging/utils";
+import { PdcDataDO } from "./do";
+import { registerQueryData } from "./tools/query-data";
+import { registerGetSchema } from "./tools/get-schema";
+
+// Export Durable Object classes
+export { PdcDataDO };
 
 // Define our NCI PDC MCP agent
 export class NciPdcMCP extends McpAgent {
@@ -17,6 +22,11 @@ export class NciPdcMCP extends McpAgent {
 
 	async init() {
 		console.error("NCI PDC MCP Server initialized.");
+		const env = this.env as unknown as PdcEnv;
+
+		// Register staging tools
+		registerQueryData(this.server, env);
+		registerGetSchema(this.server, env);
 
 		// Register the GraphQL execution tool
 		this.server.tool(
@@ -46,14 +56,44 @@ export class NciPdcMCP extends McpAgent {
 				if (variables) {
 					console.error(`With variables: ${JSON.stringify(variables).slice(0,150)}...`);
 				}
-				
+
 				const result = await this.executePdcGraphQLQuery(query, variables);
-				
-				return { 
-					content: [{ 
-						type: "text", 
-						// Pretty print JSON for easier reading by humans, and parsable by LLMs.
-						text: JSON.stringify(result, null, 2) 
+
+				// Auto-stage large responses
+				const responseString = JSON.stringify(result);
+				if (shouldStage(responseString.length) && env?.PDC_DATA_DO) {
+					try {
+						const staged = await stageToDoAndRespond(
+							result,
+							env.PDC_DATA_DO as any,
+							"pdc",
+							undefined,
+							undefined,
+							"pdc",
+						);
+						const summary = `PDC GraphQL response staged (${staged.totalRows ?? 0} rows across ${staged.tablesCreated?.length ?? 0} tables). Use pdc_query_data with data_access_id '${staged.dataAccessId}'.`;
+						return {
+							content: [{ type: "text" as const, text: summary }],
+							structuredContent: {
+								success: true,
+								staged: true,
+								data_access_id: staged.dataAccessId,
+								tables_created: staged.tablesCreated,
+								total_rows: staged.totalRows,
+								schema: staged.schema,
+								_staging: staged._staging,
+							},
+						};
+					} catch (stageErr) {
+						console.error("Auto-staging failed, returning inline:", stageErr);
+						// Fall through to inline response
+					}
+				}
+
+				return {
+					content: [{
+						type: "text" as const,
+						text: responseString
 					}]
 				};
 			}
@@ -159,11 +199,10 @@ export class NciPdcMCP extends McpAgent {
 	}
 }
 
-// Define the Env interface for environment variables, if any.
-// For this server, no specific environment variables are strictly needed for PDC API access.
-interface Env {
+interface PdcEnv {
 	MCP_HOST?: string;
 	MCP_PORT?: string;
+	PDC_DATA_DO: DurableObjectNamespace;
 }
 
 // Dummy ExecutionContext for type compatibility, usually provided by the runtime environment.
@@ -174,18 +213,18 @@ interface ExecutionContext {
 
 // Export the fetch handler, standard for environments like Cloudflare Workers or Deno Deploy.
 export default {
-	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+	async fetch(request: Request, env: PdcEnv, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
 
 		// Streamable HTTP transport (MCP 2025-11-25 spec)
 		if (url.pathname.startsWith("/mcp")) {
-			return NciPdcMCP.serve("/mcp").fetch(request, env, ctx);
+			return NciPdcMCP.serve("/mcp", { binding: "MCP_OBJECT" }).fetch(request, env, ctx);
 		}
 
 		// SSE transport (legacy, kept for backward compatibility)
 		if (url.pathname === "/sse" || url.pathname.startsWith("/sse/")) {
 			// @ts-ignore
-			return NciPdcMCP.serveSSE("/sse").fetch(request, env, ctx);
+			return NciPdcMCP.serveSSE("/sse", { binding: "MCP_OBJECT" }).fetch(request, env, ctx);
 		}
 
 		// Fallback for unhandled paths
